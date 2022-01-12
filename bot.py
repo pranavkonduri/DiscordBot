@@ -1,4 +1,3 @@
-import os
 import discord
 import logging
 import config
@@ -6,9 +5,12 @@ from discord.ext import commands
 import os
 from riotwatcher import LolWatcher, ApiError
 import requests 
-from tqdm import tqdm 
 import datetime as dt
 import asyncio, aiohttp
+from tqdm.asyncio import tqdm
+from aiolimiter import AsyncLimiter
+import json
+import time
 
 #logging.basicConfig(level=logging.INFO)
 
@@ -26,82 +28,114 @@ async def on_disconnect():
     await client.change_presence(status=discord.Status.offline, activity=discord.Game(':-)'))
 
 async def checkPlayer(api_key, region, summoner_name, channel):
+    #PHASE 1: GET SUMMONER NAME
     watcher = LolWatcher(api_key)
     try:
         response_summoner = watcher.summoner.by_name(region, summoner_name)
     except ApiError as err:
         if err.response.status_code == 429:
             print("trying again")
-        else:
-            raise
+        elif err.response.status_code == 404:
+            await channel.send("Cannot find summoner with name {0}".format(summoner_name))
+            return
     id = response_summoner['id']
     puuid = response_summoner['puuid']
     summoner_name = response_summoner['name']
+
+    #print loading message to output:
+    await channel.send("Loading information for {0}... please wait".format(summoner_name))
+
+
+    #PHASE 2: GET PLAYER'S GAMES
     matches = []
     start = 0
     count = 100
     while True:
         try:
             URL = 'https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/'+ puuid + '/ids?start='+ str(start) + '&count=' + str(count) + '&api_key=' + api_key
-            response = requests.get(URL)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(URL) as resp:
+                    response_match_list = json.loads(await resp.text()) #stringdict to dict
         except requests.HTTPError as err:
             if err.response.status_code == 429:
                 print("ratelimit")
             else:
                 print(err.response.status_code)
                 break
-        response_match_list = response.json()
         if len(response_match_list) == 0:
             break
         matches.extend(response_match_list)
         start += count #next set of games
-    
-    all_summoner_names = [summoner_name]
-    all_namechange_times = [None]
-    bar = tqdm(total=len(matches))
-    message = await channel.send("Loading...\tProgress: N/A")
+
+    if len(matches) == 0:
+        title = "No previous names for {0} found"
+        desc = "The summoner hasn't played games in a while.\n"
+        player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
+        await channel.send(embed=player_embed)
+        return 
+
     max_api_calls = 100 #at max, 100 API calls
     step_amount = max(len(matches) // max_api_calls, 1)
-    progress = "Loading information for {player}... \tProgress: {pg:.2f}% \t New Names Found: {nnf}"
+
+    #PHASE 3: GET ALL PREVIOUS NAMES THROUGH ALL PREVIOUS MATCHES
+    match_urls = []
+    for index in range (0, len(matches), step_amount):
+        match_url = 'https://americas.api.riotgames.com/lol/match/v5/matches/' + matches[index] + '?api_key=' + api_key
+        match_urls.append(match_url)
     
-    for index in range(0, len(matches), step_amount):
-        await message.edit(content=progress.format(player = all_summoner_names[0], pg = min(100, (index + step_amount) / len(matches) * 100), nnf=len(all_summoner_names) - 1))
-        bar.update(step_amount)
-        match = matches[index]
-        try:
-            MATCH_URL = 'https://americas.api.riotgames.com/lol/match/v5/matches/' + match + '?api_key=' + api_key
-            response = requests.get(MATCH_URL)
-        except requests.HTTPError as err:
-            if err.response.status_code == 429:
-                print("rate limit")
-                raise
-            else:
-                print(err.response.status_code)
-                raise
-        match_response = response.json()
-        try:
-            participants = match_response['info']['participants']
-            for player in participants:
-                if type(player) == dict:
-                    if player['summonerId'] == id:
-                        if (player['summonerName'] not in all_summoner_names):
-                            time = match_response['info']['gameStartTimestamp'] / 1000
-                            timeSTR = dt.datetime.utcfromtimestamp(time).strftime("%Y/%m/%d")
-                            all_summoner_names.append(player['summonerName'])
-                            all_namechange_times.append(timeSTR)
-                            #print(player['summonerName'], timeSTR)
-        except KeyError as err:
-            continue
-    if len(all_summoner_names) == 1:
-        title = "No previous names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
-        desc = "Either the summoner hasn't changed their name, or hasn't played games in a while."
+    #fetches a riot item - semaphore lock to control concurrency
+    async def fetch(session, sem, url, id): 
+        async with sem:
+            async with session.get(url) as response:
+                match_response = json.loads(await response.text())
+                try:
+                    participants = match_response['info']['participants']
+                    for player in participants:
+                        if type(player) == dict:
+                            if player['summonerId'] == id:
+                                time_played = match_response['info']['gameStartTimestamp'] / 1000
+                                timeSTR = dt.datetime.utcfromtimestamp(time_played).strftime("%Y/%m/%d")
+                                return (player['summonerName'], timeSTR)
+                except KeyError as err:
+                    return (None, None)
+
+    CONCURRENCY = 5 #coroutines at the same time MAX
+    TIMEOUT = 15 #if the semaphore is locked, wait 15s
+    sem = asyncio.Semaphore(CONCURRENCY)
+    try:
+        async with aiohttp.ClientSession() as session:
+            responses = await tqdm.gather(*(
+                asyncio.wait_for(fetch(session, sem, i, id), TIMEOUT)
+                for i in match_urls
+            ))
+    except asyncio.TimeoutError:
+        print("Timeout error")
+        return
+
+    seen = set()
+    res_list = [(a, b) for a, b in responses[:-1] 
+         if not (a in seen or seen.add(a)) and a is not None] 
+         
+    res_list.append(tuple(responses[-1])) #add the last one back in so we get a 
+
+    all_summoner_names, all_namechange_times = zip(*res_list)
+    print(all_summoner_names)
+    print(all_namechange_times)
+    
+    if len(all_summoner_names) <= 2:
+        title = "No previous names for {0} found: {1} games checked".format(all_summoner_names[0], len(matches))
+        if len(matches) == 0:
+            desc = "The summoner hasn't played games in a while.\n"
+        else:
+            desc = "The summoner hasn't changed their name since at least " + all_namechange_times[-1] + "."
         player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
         await channel.send(embed=player_embed)
     else:
         title = "Previous names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
         desc = ""
-        for i in range(1, len(all_namechange_times)):
+        for i in range(1, len(all_namechange_times)-1):
             desc += all_summoner_names[i-1] + "\t<-\t" + all_summoner_names[i] + "\t(~around " + all_namechange_times[i] + ")\n"
+        desc += all_summoner_names[-1] + " since at least " + all_namechange_times[-1]
         player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
         await channel.send(embed=player_embed)
 
@@ -132,21 +166,19 @@ async def on_message(message):
         message_arr = message.content.split()
         cmd = message_arr[0].replace("_","")
         if cmd == 'pcheck':
+            start = time.time()
             channel = message.channel
             riot_api_key = config.riot_api_key
             region = 'na1'
             summoner_name = ' '.join(message_arr[1:])
             if summoner_name.isspace() or summoner_name == '': #blank call of pcheck
                 await channel.send("Please send the summoner name like this: *pcheck Kshuna*")
-                return
-            if sem.locked():
-                await channel.send("Rate Limited: Please wait as the queue times are high.")
-            async with sem:                    
+                return   
+            async with limiter: #TODO: Send a message if the person needs to wait             
                 await checkPlayer(riot_api_key, region, summoner_name, channel)
+                await channel.send("Time Elapsed: {:.4f} seconds".format(time.time() - start))
 
-                    
-
-sem = asyncio.Semaphore(4) #3 processes cannot join at the same time (0->2 only)            
+limiter = AsyncLimiter(2,10)                              
 client.run(config.bot_token)
 
 #If the bot is closed or canceled
