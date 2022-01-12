@@ -8,6 +8,7 @@ from riotwatcher import LolWatcher, ApiError
 import requests 
 from tqdm import tqdm 
 import datetime as dt
+import asyncio, aiohttp
 
 #logging.basicConfig(level=logging.INFO)
 
@@ -17,16 +18,12 @@ guild = discord.Guild
 @client.event
 async def on_ready():
     print('We have logged in as {0.user}'.format(client))
-    await client.change_presence(activity=discord.Game('_scan help'))
+    await client.change_presence(activity=discord.Game(':-)'))
 
 @client.event
 async def on_disconnect():
     print('We have logged off as {0.user}'.format(client))
-    await client.change_presence(status=discord.Status.offline, activity=discord.Game('_scan help'))
-
-# @client.event
-# async def on_typing(channel, user, when):
-#     await channel.send("**What are you typing, " + user.name + "?**")
+    await client.change_presence(status=discord.Status.offline, activity=discord.Game(':-)'))
 
 async def checkPlayer(api_key, region, summoner_name, channel):
     watcher = LolWatcher(api_key)
@@ -63,11 +60,12 @@ async def checkPlayer(api_key, region, summoner_name, channel):
     all_namechange_times = [None]
     bar = tqdm(total=len(matches))
     message = await channel.send("Loading...\tProgress: N/A")
-    step_amount = 10
-    progress = "Loading...\tProgress: {pg:.2f}% \t New Names Found: {nnf}"
+    max_api_calls = 100 #at max, 100 API calls
+    step_amount = max(len(matches) // max_api_calls, 1)
+    progress = "Loading information for {player}... \tProgress: {pg:.2f}% \t New Names Found: {nnf}"
     
     for index in range(0, len(matches), step_amount):
-        await message.edit(content=progress.format(pg = min(100, (index + step_amount) / len(matches) * 100), nnf=len(all_summoner_names) - 1))
+        await message.edit(content=progress.format(player = all_summoner_names[0], pg = min(100, (index + step_amount) / len(matches) * 100), nnf=len(all_summoner_names) - 1))
         bar.update(step_amount)
         match = matches[index]
         try:
@@ -94,13 +92,18 @@ async def checkPlayer(api_key, region, summoner_name, channel):
                             #print(player['summonerName'], timeSTR)
         except KeyError as err:
             continue
-    desc = ""
-    for i in range(1, len(all_namechange_times)):
-        desc += all_summoner_names[i-1] + "\t<-\t" + all_summoner_names[i] + "\t(~around " + all_namechange_times[i] + ")\n"
-    title = "Previous Names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
-    player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
-    await message.edit(embed=player_embed)
-    return all_summoner_names
+    if len(all_summoner_names) == 1:
+        title = "No previous names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
+        desc = "Either the summoner hasn't changed their name, or hasn't played games in a while."
+        player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
+        await channel.send(embed=player_embed)
+    else:
+        title = "Previous names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
+        desc = ""
+        for i in range(1, len(all_namechange_times)):
+            desc += all_summoner_names[i-1] + "\t<-\t" + all_summoner_names[i] + "\t(~around " + all_namechange_times[i] + ")\n"
+        player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
+        await channel.send(embed=player_embed)
 
 
 @client.event
@@ -122,6 +125,7 @@ async def on_message(message):
             shutdown_embed = discord.Embed(title='Bot Update', description='I am now shutting down. See you later. BYE! :slight_smile:', color=0x8ee6dd)
             await channel.send(embed=shutdown_embed)
             await client.close()
+            exit(0)
 
     #riot player checker
     elif message.content.startswith('p'):
@@ -132,9 +136,17 @@ async def on_message(message):
             riot_api_key = config.riot_api_key
             region = 'na1'
             summoner_name = ' '.join(message_arr[1:])
-            await checkPlayer(riot_api_key, region, summoner_name, channel)
-            
-            
+            if summoner_name.isspace() or summoner_name == '': #blank call of pcheck
+                await channel.send("Please send the summoner name like this: *pcheck Kshuna*")
+                return
+            if sem.locked():
+                await channel.send("Rate Limited: Please wait as the queue times are high.")
+            async with sem:                    
+                await checkPlayer(riot_api_key, region, summoner_name, channel)
+
+                    
+
+sem = asyncio.Semaphore(4) #3 processes cannot join at the same time (0->2 only)            
 client.run(config.bot_token)
 
 #If the bot is closed or canceled
