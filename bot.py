@@ -1,16 +1,18 @@
 import os
 import discord
 import logging
-import pandas as pd
 import config
-from datetime import datetime
-import time
+from discord.ext import commands
+import os
+from riotwatcher import LolWatcher, ApiError
+import requests 
+from tqdm import tqdm 
+import datetime as dt
 
-logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.INFO)
 
 client = discord.Client()
 guild = discord.Guild
-
 
 @client.event
 async def on_ready():
@@ -22,109 +24,117 @@ async def on_disconnect():
     print('We have logged off as {0.user}'.format(client))
     await client.change_presence(status=discord.Status.offline, activity=discord.Game('_scan help'))
 
-
 # @client.event
 # async def on_typing(channel, user, when):
 #     await channel.send("**What are you typing, " + user.name + "?**")
+
+async def checkPlayer(api_key, region, summoner_name, channel):
+    watcher = LolWatcher(api_key)
+    try:
+        response_summoner = watcher.summoner.by_name(region, summoner_name)
+    except ApiError as err:
+        if err.response.status_code == 429:
+            print("trying again")
+        else:
+            raise
+    id = response_summoner['id']
+    puuid = response_summoner['puuid']
+    summoner_name = response_summoner['name']
+    matches = []
+    start = 0
+    count = 100
+    while True:
+        try:
+            URL = 'https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/'+ puuid + '/ids?start='+ str(start) + '&count=' + str(count) + '&api_key=' + api_key
+            response = requests.get(URL)
+        except requests.HTTPError as err:
+            if err.response.status_code == 429:
+                print("ratelimit")
+            else:
+                print(err.response.status_code)
+                break
+        response_match_list = response.json()
+        if len(response_match_list) == 0:
+            break
+        matches.extend(response_match_list)
+        start += count #next set of games
+    
+    all_summoner_names = [summoner_name]
+    all_namechange_times = [None]
+    bar = tqdm(total=len(matches))
+    message = await channel.send("Loading...\tProgress: N/A")
+    step_amount = 10
+    progress = "Loading...\tProgress: {pg:.2f}% \t New Names Found: {nnf}"
+    
+    for index in range(0, len(matches), step_amount):
+        await message.edit(content=progress.format(pg = min(100, (index + step_amount) / len(matches) * 100), nnf=len(all_summoner_names) - 1))
+        bar.update(step_amount)
+        match = matches[index]
+        try:
+            MATCH_URL = 'https://americas.api.riotgames.com/lol/match/v5/matches/' + match + '?api_key=' + api_key
+            response = requests.get(MATCH_URL)
+        except requests.HTTPError as err:
+            if err.response.status_code == 429:
+                print("rate limit")
+                raise
+            else:
+                print(err.response.status_code)
+                raise
+        match_response = response.json()
+        try:
+            participants = match_response['info']['participants']
+            for player in participants:
+                if type(player) == dict:
+                    if player['summonerId'] == id:
+                        if (player['summonerName'] not in all_summoner_names):
+                            time = match_response['info']['gameStartTimestamp'] / 1000
+                            timeSTR = dt.datetime.utcfromtimestamp(time).strftime("%Y/%m/%d")
+                            all_summoner_names.append(player['summonerName'])
+                            all_namechange_times.append(timeSTR)
+                            #print(player['summonerName'], timeSTR)
+        except KeyError as err:
+            continue
+    desc = ""
+    for i in range(1, len(all_namechange_times)):
+        desc += all_summoner_names[i-1] + "\t<-\t" + all_summoner_names[i] + "\t(~around " + all_namechange_times[i] + ")\n"
+    title = "Previous Names for {0}: {1} games checked".format(all_summoner_names[0], len(matches))
+    player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
+    await message.edit(embed=player_embed)
+    return all_summoner_names
+
 
 @client.event
 async def on_message(message):
     if message.author == client.user: #no infinite loops where the bot calls itself
         return
+    
     elif message.content.startswith('_'): #Commands
-
+        channel = message.channel
         cmd = message.content.split()[0].replace("_","")
         if len(message.content.split()) > 1:
             parameters = message.content.split()[1:]
 
-        # Bot Commands
-        #SCAN ALL MESSAGES
-        # if cmd == 'scan':
-
-        #     data = pd.DataFrame(columns=['content', 'time', 'author'])
-
-        #     # Acquiring the channel via the bot command
-        #     if len(message.channel_mentions) > 0:
-        #         channel = message.channel_mentions[0]
-        #     else:
-        #         channel = message.channel
-
-        #     # Aquiring the number of messages to be scraped via the bot command
-        #     if (len(message.content.split()) > 1 and len(message.channel_mentions) == 0) or len(message.content.split()) > 2:
-        #         for parameter in parameters:
-        #             if parameter == "help":
-        #                 answer = discord.Embed(title="Command Format",
-        #                                        description="""`_scan <channel> <number_of_messages>`\n\n`<channel>` : **the channel you wish to scan**\n`<number_of_messages>` : **the number of messages you wish to scan**\n\n*The order of the parameters does not matter.*""",
-        #                                        colour=0x1a7794) 
-        #                 await message.channel.send(embed=answer)
-        #                 return
-        #             elif parameter[0] != "<": # Channels are enveloped by "<>" as strings
-        #                 limit = int(parameter)
-        #     else:
-        #         limit = 100
-            
-        #     answer = discord.Embed(title="Creating your Message History Dataframe",
-        #                            description="Please Wait. The data will be sent to you privately once it's finished.",
-        #                            colour=0x1a7794) 
-
-        #     await message.channel.send(embed=answer)
-
-        #     def is_command (message):
-        #         if len(msg.content) == 0:
-        #             return False
-        #         elif msg.content.split()[0] == '_scan':
-        #             return True
-        #         else:
-        #             return False
-
-        #     async for msg in channel.history(limit=limit + 1000):       # The added 1000 is so in case it skips messages for being
-        #         if msg.author != client.user:                           # a command or a message it sent, it will still read the
-        #             if not is_command(msg):                             # the total amount originally specified by the user.
-        #                 data = data.append({'content': msg.content,
-        #                                     'time': msg.created_at,
-        #                                     'author': msg.author.name}, ignore_index=True)
-        #             if len(data) == limit:
-        #                 break
-            
-        #     # Turning the pandas dataframe into a .csv file and sending it to the user
-
-        #     file_location = f"{str(channel.guild.id) + '_' + str(channel.id)}.csv" # Determining file name and location
-        #     data.to_csv(file_location) # Saving the file as a .csv via pandas
-
-        #     answer = discord.Embed(title="Here is yousr .CSV File",
-        #                            description=f"""It might have taken a while, but here is what you asked for.\n\n`Server` : **{message.guild.name}**\n`Channel` : **{channel.name}**\n`Messages Read` : **{limit}**""",
-        #                            colour=0x1a7794) 
-
-        #     await message.author.send(embed=answer)
-        #     await message.author.send(file=discord.File(file_location, filename='data.csv')) # Sending the file
-        #     os.remove(file_location) # Deleting the file
-
         #ECHO MESSAGE BACK TO THE USER
         elif cmd == 'echo':
-            channel = message.channel
             await channel.send("*YOUR MESSAGE:* " + message.content.replace("_echo", "", 1))
+        
+        elif cmd == 'shutdown':
+            shutdown_embed = discord.Embed(title='Bot Update', description='I am now shutting down. See you later. BYE! :slight_smile:', color=0x8ee6dd)
+            await channel.send(embed=shutdown_embed)
+            await client.close()
 
-        #SIMULATE TYPERACER TBD
-        elif cmd == 'typeracer':
-            if len(message.mentions) == 0: #If you didn't @ anyone like a stupid
-                answer = discord.Embed(title="Command Format",
-                                               description="""`_typeracer [users] '""",
-                                               colour=0x1a7794) 
-                await message.channel.send(embed=answer)
-                return
-            else:
-                stats = {}
-                for member in message.mentions:
-                    await member.send("Good luck! The typeracer will begin in 5 seconds.")
-                    stats[member.name] = [datetime.now()]
-                time.sleep(5)
-                for member in message.mentions:
-                    await member.send("Congrats!")
-                    stats[member.name] = (datetime.now() - stats[member.name][0]).total_seconds()
-                
-                print()
-                print(stats)
-
+    #riot player checker
+    elif message.content.startswith('p'):
+        message_arr = message.content.split()
+        cmd = message_arr[0].replace("_","")
+        if cmd == 'pcheck':
+            channel = message.channel
+            riot_api_key = config.riot_api_key
+            region = 'na1'
+            summoner_name = ' '.join(message_arr[1:])
+            await checkPlayer(riot_api_key, region, summoner_name, channel)
+            
+            
 client.run(config.bot_token)
 
 #If the bot is closed or canceled
