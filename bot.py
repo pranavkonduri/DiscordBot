@@ -76,7 +76,7 @@ async def checkPlayer(api_key, region, summoner_name, channel):
 
     max_api_calls = 100 #at max, 100 API calls
     step_amount = max(len(matches) // max_api_calls, 1)
-
+    
     #PHASE 3: GET ALL PREVIOUS NAMES THROUGH ALL PREVIOUS MATCHES
     match_urls = []
     for index in range (0, len(matches), step_amount):
@@ -84,20 +84,22 @@ async def checkPlayer(api_key, region, summoner_name, channel):
         match_urls.append(match_url)
     
     #fetches a riot item - semaphore lock to control concurrency
-    async def fetch(session, sem, url, id): 
+    async def fetch(session, sem, url, puuid): 
         async with sem:
             async with session.get(url) as response:
                 match_response = json.loads(await response.text())
                 try:
                     participants = match_response['info']['participants']
+                    time_played = match_response['info']['gameStartTimestamp'] / 1000
+                    timeSTR = dt.datetime.utcfromtimestamp(time_played).strftime("%Y/%m/%d")
                     for player in participants:
                         if type(player) == dict:
-                            if player['summonerId'] == id:
-                                time_played = match_response['info']['gameStartTimestamp'] / 1000
-                                timeSTR = dt.datetime.utcfromtimestamp(time_played).strftime("%Y/%m/%d")
+                            if player['puuid'] == puuid:
                                 return (player['summonerName'], timeSTR)
                 except KeyError as err:
                     return (None, None)
+                else:
+                    return (None, timeSTR)
 
     CONCURRENCY = 5 #coroutines at the same time MAX
     TIMEOUT = 15 #if the semaphore is locked, wait 15s
@@ -105,7 +107,7 @@ async def checkPlayer(api_key, region, summoner_name, channel):
     try:
         async with aiohttp.ClientSession() as session:
             responses = await tqdm.gather(*(
-                asyncio.wait_for(fetch(session, sem, i, id), TIMEOUT)
+                asyncio.wait_for(fetch(session, sem, i, puuid), TIMEOUT)
                 for i in match_urls
             ))
     except asyncio.TimeoutError:
@@ -115,12 +117,16 @@ async def checkPlayer(api_key, region, summoner_name, channel):
     seen = set()
     res_list = [(a, b) for a, b in responses[:-1] 
          if not (a in seen or seen.add(a)) and a is not None] 
-         
-    res_list.append(tuple(responses[-1])) #add the last one back in so we get a 
+    
+    back_index = 1
+    while back_index < len(responses): #solves issue where last index is a None: keep going back until we get something substantive
+        if responses[-back_index][0] is not None:
+            res_list.append(tuple(responses[-back_index])) #add the last one back in so we get a 
+            break
+        else:
+            back_index += 1
 
     all_summoner_names, all_namechange_times = zip(*res_list)
-    print(all_summoner_names)
-    print(all_namechange_times)
     
     if len(all_summoner_names) <= 2:
         title = "No previous names for {0} found: {1} games checked".format(all_summoner_names[0], len(matches))
