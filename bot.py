@@ -1,8 +1,7 @@
 import discord
-import logging
+from discord import FFmpegPCMAudio
 import config
 from discord.ext import commands
-import os
 from riotwatcher import LolWatcher, ApiError
 import requests 
 import datetime as dt
@@ -11,9 +10,14 @@ from tqdm.asyncio import tqdm
 from aiolimiter import AsyncLimiter
 import json
 import time
+import pafy
 
-#logging.basicConfig(level=logging.INFO)
 
+#TODO: make bot into class instead of global var
+
+intents = discord.Intents().all()
+FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn'}
+bot = commands.Bot(command_prefix='$', intents=intents)
 client = discord.Client()
 guild = discord.Guild
 
@@ -38,7 +42,6 @@ async def checkPlayer(api_key, region, summoner_name, channel):
         elif err.response.status_code == 404:
             await channel.send("Cannot find summoner with name {0}".format(summoner_name))
             return
-    id = response_summoner['id']
     puuid = response_summoner['puuid']
     summoner_name = response_summoner['name']
 
@@ -145,30 +148,13 @@ async def checkPlayer(api_key, region, summoner_name, channel):
         player_embed = discord.Embed(title=title, description=desc, color=0x8ee6dd)
         await channel.send(embed=player_embed)
 
-
 @client.event
 async def on_message(message):
     if message.author == client.user: #no infinite loops where the bot calls itself
         return
-    
-    elif message.content.startswith('_'): #Commands
-        channel = message.channel
-        cmd = message.content.split()[0].replace("_","")
-        if len(message.content.split()) > 1:
-            parameters = message.content.split()[1:]
-
-        #ECHO MESSAGE BACK TO THE USER
-        elif cmd == 'echo':
-            await channel.send("*YOUR MESSAGE:* " + message.content.replace("_echo", "", 1))
-        
-        elif cmd == 'shutdown':
-            shutdown_embed = discord.Embed(title='Bot Update', description='I am now shutting down. See you later. BYE! :slight_smile:', color=0x8ee6dd)
-            await channel.send(embed=shutdown_embed)
-            await client.close()
-            exit(0)
 
     #riot player checker
-    elif message.content.startswith('p'):
+    elif message.content.startswith('pcheck'):
         message_arr = message.content.split()
         cmd = message_arr[0].replace("_","")
         if cmd == 'pcheck':
@@ -183,6 +169,32 @@ async def on_message(message):
             async with limiter: #TODO: Send a message if the person needs to wait             
                 await checkPlayer(riot_api_key, region, summoner_name, channel)
                 await channel.send("Time Elapsed: {:.4f} seconds".format(time.time() - start))
+
+    #https://stackoverflow.com/questions/66115216/discord-py-play-audio-from-url
+    elif message.content.startswith('play'):
+        message_arr = message.content.split()
+        url = message_arr[1]
+        #url = "https://www.youtube.com/watch?v=W3OMX9J_rLs"
+        channel = message.channel
+        if message.author.voice == None:
+            await channel.send(embed=discord.Embed.txt("No Voice Channel", "You need to be in a voice channel to use this command!", message.author))
+            return
+
+        voice_channel = message.author.voice.channel
+        voice = discord.utils.get(message.guild.voice_channels, name=voice_channel.name)
+        voice_client = discord.utils.get(client.voice_clients, guild=guild)
+
+        if voice_client == None:
+            voice_client = await voice.connect()
+        else:
+            await voice_client.move_to(channel)
+
+        await channel.send(url)
+        song = pafy.new(url)
+        audio = song.getbestaudio()  # gets an audio source
+        source = FFmpegPCMAudio(audio.url, **FFMPEG_OPTIONS)  # converts the youtube audio source into a source discord can use
+        voice_client.play(source=source)  # play the source
+        
 
 limiter = AsyncLimiter(2,10)                              
 client.run(config.bot_token)
